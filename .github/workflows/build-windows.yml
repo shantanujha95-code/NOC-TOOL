@@ -1,0 +1,483 @@
+name: Windows Build + Embedded PuTTY Functional Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHON_VERSION: "3.11"
+  PUTTY_VERSION: "0.84"
+
+jobs:
+  build-test-windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Do NOT use pip cache here. The project may be inside the ZIP.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Locate or extract project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $project = Join-Path $env:GITHUB_WORKSPACE "project"
+
+          if (Test-Path $project) {
+            Remove-Item $project -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $project -Force | Out-Null
+
+          $directSpec = Join-Path $env:GITHUB_WORKSPACE "NetworkBackupTool.spec"
+          $directMain = Join-Path $env:GITHUB_WORKSPACE "main.py"
+
+          if ((Test-Path $directSpec) -and (Test-Path $directMain)) {
+            Write-Host "Project is directly in repository."
+
+            Get-ChildItem $env:GITHUB_WORKSPACE -Force |
+              Where-Object {
+                $_.Name -notin @(".git", "project", "ci-artifacts")
+              } |
+              Copy-Item -Destination $project -Recurse -Force
+          }
+          else {
+            Write-Host "Project is not at repository root. Searching ZIP..."
+
+            $zip = Get-ChildItem `
+              -Path $env:GITHUB_WORKSPACE `
+              -Filter "*.zip" `
+              -File `
+              -Recurse |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+
+            if (-not $zip) {
+              throw "No ZIP file was found."
+            }
+
+            Write-Host "ZIP: $($zip.FullName)"
+
+            $extract = Join-Path $env:RUNNER_TEMP "network-backup-extracted"
+
+            if (Test-Path $extract) {
+              Remove-Item $extract -Recurse -Force
+            }
+
+            New-Item -ItemType Directory -Path $extract -Force | Out-Null
+
+            Expand-Archive `
+              -Path $zip.FullName `
+              -DestinationPath $extract `
+              -Force
+
+            $spec = Get-ChildItem `
+              -Path $extract `
+              -Filter "NetworkBackupTool.spec" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+
+            if (-not $spec) {
+              throw "NetworkBackupTool.spec was not found inside the ZIP."
+            }
+
+            Write-Host "Project root: $($spec.Directory.FullName)"
+
+            Copy-Item `
+              -Path (Join-Path $spec.Directory.FullName "*") `
+              -Destination $project `
+              -Recurse `
+              -Force
+          }
+
+          $required = @(
+            "main.py",
+            "requirements.txt",
+            "NetworkBackupTool.spec",
+            "putty_embed.py",
+            "ops_gui.py",
+            "ssh_session.py",
+            "backup_engine.py",
+            "device_manager.py",
+            "change_history.py",
+            "config_templates.py",
+            "compliance.py",
+            "report_generator.py",
+            "tests\test_real_embedded_putty.py"
+          )
+
+          foreach ($file in $required) {
+            $path = Join-Path $project $file
+
+            if (-not (Test-Path $path)) {
+              throw "Required file missing: $file"
+            }
+
+            Write-Host "FOUND: $file"
+          }
+
+          "PROJECT_DIR=$project" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Prepare artifact directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dir = Join-Path $env:GITHUB_WORKSPACE "ci-artifacts"
+
+          if (Test-Path $dir) {
+            Remove-Item $dir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+          "ARTIFACT_DIR=$dir" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Python dependencies
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python --version
+
+          python -m pip install --upgrade pip setuptools wheel
+
+          if (-not (Test-Path requirements.txt)) {
+            throw "requirements.txt not found in $PWD"
+          }
+
+          python -m pip install -r requirements.txt
+
+          python -m pip install pytest pytest-timeout pyinstaller
+
+      - name: Validate Python syntax
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m compileall -q .
+
+      - name: Run complete existing test suite
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m pytest `
+            tests `
+            -q `
+            -ra `
+            --junitxml="$env:ARTIFACT_DIR\test-results.xml"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Existing test suite failed."
+          }
+
+      - name: Run application startup smoke test
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python main.py --smoke-test
+
+      - name: Download official PuTTY 0.84
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:PUTTY_VERSION
+          $name = "putty-64bit-$version-installer.msi"
+
+          $url = "https://the.earth.li/~sgtatham/putty/$version/w64/$name"
+          $sumUrl = "https://the.earth.li/~sgtatham/putty/$version/sha256sums"
+
+          $installer = Join-Path $env:RUNNER_TEMP $name
+          $sums = Join-Path $env:RUNNER_TEMP "putty-sha256sums"
+
+          Write-Host "Downloading PuTTY:"
+          Write-Host $url
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer `
+            -UseBasicParsing
+
+          Invoke-WebRequest `
+            -Uri $sumUrl `
+            -OutFile $sums `
+            -UseBasicParsing
+
+          $line = Get-Content $sums |
+            Where-Object {
+              $_ -match [regex]::Escape($name)
+            } |
+            Select-Object -First 1
+
+          if (-not $line) {
+            throw "Could not find official checksum for $name"
+          }
+
+          if ($line -notmatch '^(?<hash>[A-Fa-f0-9]{64})\s+\*?(?<file>.+)$') {
+            throw "Unable to parse official PuTTY checksum."
+          }
+
+          $expected = $Matches.hash.ToLowerInvariant()
+
+          $actual = (
+            Get-FileHash `
+              -Path $installer `
+              -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          Write-Host "Expected SHA-256: $expected"
+          Write-Host "Actual SHA-256:   $actual"
+
+          if ($expected -ne $actual) {
+            throw "PuTTY SHA-256 verification FAILED."
+          }
+
+          "PUTTY_INSTALLER=$installer" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install PuTTY
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $p = Start-Process `
+            msiexec.exe `
+            -ArgumentList @(
+              "/i",
+              "`"$env:PUTTY_INSTALLER`"",
+              "/qn",
+              "/norestart"
+            ) `
+            -Wait `
+            -PassThru
+
+          if ($p.ExitCode -ne 0) {
+            throw "PuTTY MSI installation failed. ExitCode=$($p.ExitCode)"
+          }
+
+      - name: Locate putty.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $paths = @(
+            "C:\Program Files\PuTTY\putty.exe",
+            "C:\Program Files (x86)\PuTTY\putty.exe"
+          )
+
+          $putty = $null
+
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              $putty = $path
+              break
+            }
+          }
+
+          if (-not $putty) {
+            $found = Get-ChildItem `
+              "C:\Program Files",
+              "C:\Program Files (x86)" `
+              -Filter "putty.exe" `
+              -File `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+            if ($found) {
+              $putty = $found.FullName
+            }
+          }
+
+          if (-not $putty) {
+            throw "putty.exe was not found."
+          }
+
+          Write-Host "PuTTY: $putty"
+
+          "PUTTY_PATH=$putty" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Validate PuTTY executable without launching it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = Get-Item $env:PUTTY_PATH
+
+          if ($file.Length -le 0) {
+            throw "putty.exe is empty."
+          }
+
+          Write-Host "PuTTY size: $($file.Length) bytes"
+          Write-Host "PuTTY executable validation PASSED."
+
+      - name: Run REAL embedded PuTTY regression
+        shell: pwsh
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          RUN_REAL_PUTTY_TEST: "1"
+          PUTTY_PATH: ${{ env.PUTTY_PATH }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "============================================"
+          Write-Host "REAL EMBEDDED PUTTY TEST"
+          Write-Host "============================================"
+
+          python -m pytest `
+            -v `
+            -s `
+            --tb=long `
+            --timeout=180 `
+            tests\test_real_embedded_putty.py `
+            --junitxml="$env:ARTIFACT_DIR\real-embedded-putty-results.xml"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "REAL embedded PuTTY test FAILED."
+          }
+
+      - name: Build NetworkBackupTool.exe
+        shell: pwsh
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            NetworkBackupTool.spec
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller build failed."
+          }
+
+          $exe = Join-Path $env:PROJECT_DIR "dist\NetworkBackupTool.exe"
+
+          if (-not (Test-Path $exe)) {
+            throw "NetworkBackupTool.exe was not created."
+          }
+
+          "EXE_PATH=$exe" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path $env:EXE_PATH)) {
+            throw "EXE not found."
+          }
+
+          $item = Get-Item $env:EXE_PATH
+
+          if ($item.Length -lt 100000) {
+            throw "EXE is unexpectedly small: $($item.Length) bytes"
+          }
+
+          Write-Host "EXE: $($item.FullName)"
+          Write-Host "Size: $($item.Length) bytes"
+
+      - name: Launch packaged GUI and verify process stays alive
+        shell: pwsh
+        timeout-minutes: 4
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dir = Split-Path $env:EXE_PATH -Parent
+
+          $proc = Start-Process `
+            -FilePath $env:EXE_PATH `
+            -WorkingDirectory $dir `
+            -PassThru
+
+          Start-Sleep -Seconds 8
+
+          if ($proc.HasExited) {
+            throw "GUI process exited during startup. ExitCode=$($proc.ExitCode)"
+          }
+
+          Write-Host "GUI started successfully. PID=$($proc.Id)"
+
+          Stop-Process `
+            -Id $proc.Id `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+      - name: Collect diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Get-Process |
+            Sort-Object ProcessName |
+            Format-Table ProcessName, Id, CPU, WorkingSet -AutoSize |
+            Out-File "$env:ARTIFACT_DIR\processes.txt"
+
+          Get-Process putty `
+            -ErrorAction SilentlyContinue |
+            Format-List * |
+            Out-File "$env:ARTIFACT_DIR\putty-process.txt"
+
+          python --version |
+            Out-File "$env:ARTIFACT_DIR\python-version.txt"
+
+          python -m pip freeze |
+            Out-File "$env:ARTIFACT_DIR\pip-freeze.txt"
+
+      - name: Upload Windows EXE
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetworkBackupTool-windows-${{ github.sha }}
+          path: ${{ env.PROJECT_DIR }}/dist/NetworkBackupTool.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetworkBackupTool-test-results-${{ github.sha }}
+          path: ${{ env.ARTIFACT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 14
